@@ -1,0 +1,7 @@
+path: /Users/thongvuong/plate_ml/ml_core/data/LP_detection
+train: images/train
+val: images/val
+
+# Classes
+nc: 1
+names: ['license_plate']

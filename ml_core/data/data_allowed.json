@@ -1,0 +1,26 @@
+[
+    {
+        "plate": "29-A1 123.45",
+        "owner": "Nguyễn Văn Hùng",
+        "type": "Xe máy Honda SH",
+        "status": "Allowed"
+    },
+    {
+        "plate": "30F-888.88",
+        "owner": "Lê Hoài Thu",
+        "type": "Ô tô Mercedes E300",
+        "status": "Allowed"
+    },
+    {
+        "plate": "59C2-999.99",
+        "owner": "Trần Minh Hoàng",
+        "type": "Xe máy Vespa",
+        "status": "Allowed"
+    },
+    {
+        "plate": "88A-777.77",
+        "owner": "Phạm Quốc Bảo",
+        "type": "Ô tô VinFast VF8",
+        "status": "Allowed"
+    }
+]
