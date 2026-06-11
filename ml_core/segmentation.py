@@ -18,10 +18,10 @@ _YOLO_LP_DETECT = None
 _YOLO_LP_OCR = None
 _YOLO_MODELS_LOADED = False
 
-# Đường dẫn local YOLOv5 (đã có trong cache, không cần download)
+# Đường dẫn local YOLOv5 source (đã cache)
 _YOLOV5_LOCAL = os.path.expanduser('~/.cache/torch/hub/ultralytics_yolov5_master')
-_MODEL_DIR = os.path.join(os.path.dirname(__file__), '..', 'reference_src', 'model')
-_MODEL_DIR = os.path.abspath(_MODEL_DIR)
+# Đường dẫn chứa file model .pt — trong reference_src/model
+_MODEL_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'reference_src', 'model'))
 
 def _load_yolo_models():
     global _YOLO_LP_DETECT, _YOLO_LP_OCR, _YOLO_MODELS_LOADED
@@ -621,13 +621,127 @@ def _extend_square_plate_if_needed(plate_box, car_img):
     return plate_box
 
 
+def _perspective_correct(plate_crop_raw):
+    """
+    Áp dụng Perspective Transform để nắn thẳng biển số bị lệch góc nhìn.
+    Thuật toán:
+      1. Tìm vùng sáng lớn nhất trong ảnh (vùng biển số trắng)
+      2. Xấp xỉ contour → 4 góc → warpPerspective
+      3. Fallback: dùng minAreaRect → boxPoints
+    Cải tiến: Hạ thấp ngưỡng diện tích (10% thay vì 25%) để khắp phục biển nhỏ/lệch góc nặng.
+    Trả về ảnh đã được nắn hoặc ảnh gốc nếu không tìm được 4 góc.
+    """
+    if plate_crop_raw is None or plate_crop_raw.size == 0:
+        return plate_crop_raw
+
+    h, w = plate_crop_raw.shape[:2]
+    if h < 10 or w < 20:
+        return plate_crop_raw
+
+    # --- Bước 1: Tìm mask vùng biển ---
+    # CLAHE + threshold để lấy vùng sáng của biển
+    lab = cv2.cvtColor(plate_crop_raw, cv2.COLOR_BGR2LAB)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+    l_eq = clahe.apply(l_ch)
+
+    # Otsu trên kênh L đã equalize
+    _, mask = cv2.threshold(l_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Morphology đóng để lấp lỗ hổng giữa chữ (tăng kích thước kernel một chút)
+    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, w // 6), max(3, h // 3)))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
+
+    # Morphology mở để loại nhiễu biên
+    k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open)
+
+    # --- Bước 2: Tìm contour lớn nhất ---
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return plate_crop_raw
+
+    # Hạ ngưỡng diện tích từ 25% xuống 10% để phục vụ biển lệch góc nặng hoặc nhỏ
+    min_area = w * h * 0.10
+    valid = [c for c in contours if cv2.contourArea(c) >= min_area]
+    if not valid:
+        valid = contours  # fallback: dùng tất cả
+    largest = max(valid, key=cv2.contourArea)
+
+    # --- Bước 3: Xấp xỉ polygon → cố gắng lấy 4 góc ---
+    peri = cv2.arcLength(largest, True)
+    approx = cv2.approxPolyDP(largest, 0.04 * peri, True)
+
+    def _order_pts(pts):
+        """Sắp xếp 4 điểm: top-left, top-right, bottom-right, bottom-left."""
+        pts = pts.reshape(4, 2).astype(np.float32)
+        s = pts.sum(axis=1)
+        diff = np.diff(pts, axis=1)
+        return np.array([
+            pts[np.argmin(s)],   # top-left
+            pts[np.argmin(diff)], # top-right
+            pts[np.argmax(s)],   # bottom-right
+            pts[np.argmax(diff)], # bottom-left
+        ], dtype=np.float32)
+
+    src_pts = None
+    if len(approx) == 4:
+        src_pts = _order_pts(approx)
+    else:
+        # Fallback: minAreaRect → boxPoints
+        rect = cv2.minAreaRect(largest)
+        box = cv2.boxPoints(rect).astype(np.float32)
+        src_pts = _order_pts(box)
+
+    # --- Bước 4: Tính kích thước đích ---
+    tl, tr, br, bl = src_pts
+    width_top  = np.linalg.norm(tr - tl)
+    width_bot  = np.linalg.norm(br - bl)
+    height_l   = np.linalg.norm(bl - tl)
+    height_r   = np.linalg.norm(br - tr)
+
+    dst_w = int(max(width_top, width_bot))
+    dst_h = int(max(height_l, height_r))
+
+    if dst_w < 20 or dst_h < 8:
+        return plate_crop_raw
+
+    # Cho phép phóng to lên đến 2.5× để xử lý biển nghiêng lệch góc nặng
+    dst_w = min(dst_w, int(w * 2.5))
+    dst_h = min(dst_h, int(h * 2.5))
+
+    dst_pts = np.array([
+        [0, 0],
+        [dst_w - 1, 0],
+        [dst_w - 1, dst_h - 1],
+        [0, dst_h - 1],
+    ], dtype=np.float32)
+
+    # --- Bước 5: Warp Perspective ---
+    M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+    warped = cv2.warpPerspective(plate_crop_raw, M, (dst_w, dst_h),
+                                  flags=cv2.INTER_LINEAR,
+                                  borderMode=cv2.BORDER_REPLICATE)
+
+    # Chỉ giữ kết quả nếu aspect ratio kết quả hợp lý hơn ảnh gốc
+    # (biển thực tế luôn có AR ≥ 1.2, relaxed từ 1.5 để phục vụ biển 2 dòng)
+    warped_ar = dst_w / float(dst_h) if dst_h > 0 else 0
+    orig_ar   = w / float(h) if h > 0 else 0
+    if warped_ar < 1.0:  # kết quả tệ hơn → giữ nguyên
+        return plate_crop_raw
+
+    return warped
+
+
 def detect_plate(car_img):
     """
     Phát hiện biển số xe bằng YOLOv5 LP_detector.pt — y chang reference project.
     Pipeline:
       1. Dùng LP_detector.pt detect vị trí biển (size=640)
-      2. Crop từng biển, thử deskew 4 combo (cc, ct) = (0,0),(0,1),(1,0),(1,1)
-      3. Nếu YOLO fail → fallback OpenCV
+      2. Crop biển + padding 15%
+      3. Perspective correction (nắn biển lệch góc)
+      4. Deskew 4 combo (change_cons, center_thres) y chang reference
+      5. Nếu YOLO fail → fallback OpenCV
     """
     h_img, w_img = car_img.shape[:2]
 
@@ -635,37 +749,55 @@ def detect_plate(car_img):
 
     if yolo_detect is not None:
         try:
-            # Reference dùng ảnh BGR trực tiếp (không convert RGB)
             plates = yolo_detect(car_img, size=640)
             list_plates = plates.pandas().xyxy[0].values.tolist()
 
             if len(list_plates) > 0:
-                # Sắp xếp theo confidence giảm dần
                 list_plates = sorted(list_plates, key=lambda p: p[4], reverse=True)
                 plate = list_plates[0]
                 conf = float(plate[4])
 
-                x  = int(plate[0])
-                y  = int(plate[1])
-                w  = int(plate[2] - plate[0])
-                h  = int(plate[3] - plate[1])
-
-                # Clip vào biên ảnh
-                x = max(0, x);  y = max(0, y)
-                w = min(w_img - x, max(10, w))
-                h = min(h_img - y, max(10, h))
+                x  = max(0, int(plate[0]))
+                y  = max(0, int(plate[1]))
+                w  = min(w_img - x, max(10, int(plate[2] - plate[0])))
+                h  = min(h_img - y, max(10, int(plate[3] - plate[1])))
                 plate_box = [x, y, w, h]
 
-                # Tự động mở rộng nếu biển vuông bị cắt
+                # Mở rộng biển vuông bị detect thiếu hàng dưới
                 plate_box = _extend_square_plate_if_needed(plate_box, car_img)
                 x, y, w, h = plate_box
-                plate_crop = car_img[y:y+h, x:x+w]
 
-                # debug_imgs
+                # PADDING 15% để tránh mất mép khi biển nghiêng
+                pad_x = max(6, int(w * 0.15))
+                pad_y = max(6, int(h * 0.15))
+                x1 = max(0, x - pad_x);    y1 = max(0, y - pad_y)
+                x2 = min(w_img, x+w+pad_x); y2 = min(h_img, y+h+pad_y)
+                plate_crop_raw = car_img[y1:y2, x1:x2]
+
+                # PERSPECTIVE CORRECTION — nắn biển lệch góc nhìn
+                plate_persp = _perspective_correct(plate_crop_raw)
+
+                # DESKEW 4 COMBO — y chang reference lp_image.py
+                best_crop  = plate_persp.copy()
+                best_angle = 999.0
+                for change_cons in range(2):
+                    for center_thres in range(2):
+                        try:
+                            deskewed = _deskew(plate_persp, change_cons, center_thres)
+                            residual = abs(_compute_skew(deskewed, 0))
+                            if residual < best_angle:
+                                best_angle = residual
+                                best_crop  = deskewed
+                        except Exception:
+                            pass
+
+                plate_crop = best_crop
+
                 gray_orig = cv2.cvtColor(car_img, cv2.COLOR_BGR2GRAY)
+                enhanced  = _enhance_contrast(car_img)
                 debug_imgs = {
                     'gray':         gray_orig,
-                    'enhanced':     car_img,
+                    'enhanced':     enhanced,
                     'blurred':      gray_orig,
                     'edged':        gray_orig,
                     'sobel':        gray_orig,
@@ -944,8 +1076,8 @@ def segment_characters(plate_img):
     
     Phương pháp xử lý ảnh (OpenCV pipeline):
     1. Tiền xử lý: CLAHE nâng tương phản kênh LAB + Lọc nhiễu Bilateral Filter.
-    2. Căn thẳng: Hough Lines P phát hiện góc nghiêng và xoay thẳng biển số.
-    3. Nhị phân hóa thông minh: Adaptive Thresholding (Gaussian) tự động đảo ngược 
+    2. Căn thẳng tích cực: PERSPECTIVE CORRECTION (nắn biển lệch góc) + Hough Lines P.
+    3. Nhị phân hóa thông minh: Adaptive Thresholding (Gaussian) tự động đảo ngược
        để đảm bảo chữ luôn màu trắng (255) trên nền đen (0).
     4. Adaptive Morphology: Dùng phép toán đóng (MORPH_CLOSE) với kernel (3,3) 
        để nối các vết rạn nứt nhỏ.
@@ -956,7 +1088,7 @@ def segment_characters(plate_img):
     8. Thuật toán TÁCH NGANG thông minh (Horizontal Splitting): Phát hiện các ký tự bị dính nhau
        (aspect ratio w/h quá to > 0.8), tự động chia đôi hoặc chia ba theo chiều ngang.
     9. Sắp xếp thứ tự đọc khoa học: 1 hàng (sắp xếp theo X), 2 hàng (chia nhóm Y rồi sắp xếp theo X).
-    10. Chuẩn hóa kích thước: Cắt ký tự, tạo viền đệm an toàn (padding 15%) và resize về 28x28.
+    10. Chuẩn hóa kích thước: Cắt ký tự, tạo viền đệm an toàn (padding 15%) và resize về 32x32.
     """
     if plate_img is None or plate_img.size == 0:
         return _make_fallback_chars(8), np.zeros((40, 100), dtype=np.uint8)
@@ -975,11 +1107,15 @@ def segment_characters(plate_img):
     # Bước 2: Tăng cường tương phản (CLAHE) + Khử nhiễu
     enhanced_plate = _enhance_contrast(plate_img)
     
+    # Bước 2.5: PERSPECTIVE CORRECTION TÍCH CỰC cho biển đặc biệt lệch góc
+    # Cơ chế: Nếu dữ liệu thay đổi quá nhanh → có khả năng lệch góc nặng
+    persp_corrected = _perspective_correct(enhanced_plate)
+
     # Bước 3: Căn thẳng biển nghiêng (Deskew)
-    deskewed = plate_img
+    deskewed = persp_corrected  # Dùng phiên bản đã correct perspective
     if h_plate >= 20 and w_plate >= 40:
-        deskewed = deskew_plate(enhanced_plate, use_clahe=False, center_thres=0)
-        
+        deskewed = deskew_plate(persp_corrected, use_clahe=False, center_thres=0)
+
     # Bước 4: Chuyển xám + Lọc Bilateral
     gray, blurred = preprocess_image(deskewed)
     
@@ -1136,7 +1272,8 @@ def segment_characters(plate_img):
         pad = max(3, int(max(w, h) * 0.15))
         char_padded = cv2.copyMakeBorder(char_crop, pad, pad, pad, pad,
                                           cv2.BORDER_CONSTANT, value=0)
-        char_resized = cv2.resize(char_padded, (28, 28), interpolation=cv2.INTER_AREA)
+        # Resize về 32×32 để tương thích với HOG engine (img_size=(32,32))
+        char_resized = cv2.resize(char_padded, (32, 32), interpolation=cv2.INTER_AREA)
         sorted_chars.append({"image": char_resized, "box": [x, y, w, h]})
         
     if not sorted_chars:
@@ -1310,3 +1447,42 @@ def draw_characters_on_plate(plate_img, char_boxes, recognized_chars=None):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 100), 1, cv2.LINE_AA)
     
     return img_draw
+
+
+def _aggressive_straighten_plate(plate_img):
+    """
+    Xử lý tích cực cho biển số bị lệch góc nhìn (skewed view).
+    Áp dụng kết hợp perspective correction + multiple deskew attempts để tìm góc tốt nhất.
+
+    Trả về tuple: (straightened_img, was_corrected)
+    - straightened_img: ảnh sau khi được nắn thẳng
+    - was_corrected: True nếu đã áp dụng perspective correction hoặc deskew đáng kể
+    """
+    if plate_img is None or plate_img.size == 0:
+        return plate_img, False
+
+    h, w = plate_img.shape[:2]
+    if h < 15 or w < 30:
+        return plate_img, False
+
+    # Thử perspective correction trước
+    persp = _perspective_correct(plate_img)
+    was_corrected = (persp.shape != plate_img.shape or not np.array_equal(persp, plate_img))
+
+    # Sau đó thử deskew với nhiều tổ hợp tham số để tìm góc tốt nhất
+    best_img = persp
+    best_angle = 999.0
+
+    for use_clahe in [True, False]:
+        for center_thres in [0, 1]:
+            try:
+                deskewed_trial = _deskew(persp, int(use_clahe), center_thres)
+                residual = abs(_compute_skew(deskewed_trial, 0))
+                if residual < best_angle:
+                    best_angle = residual
+                    best_img = deskewed_trial
+                    was_corrected = True
+            except Exception:
+                pass
+
+    return best_img, was_corrected
