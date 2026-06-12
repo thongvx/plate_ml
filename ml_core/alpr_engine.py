@@ -166,12 +166,37 @@ class ALPREngine:
         char_imgs: [{"image": np.ndarray}, ...]
         Trả về (plate_string, mean_confidence, per_char_results)
         per_char_results: [{"char": str, "confidence": float}, ...]
-        """
-        results = []
-        for item in char_imgs:
-            ch, conf = self.predict(item["image"])
-            results.append({"char": ch, "confidence": conf})
 
+        Tự động lọc nhiễu:
+          1. Bỏ ký tự có confidence < 0.35 (nhiễu/viền khung thường < 10%)
+          2. Nếu vẫn còn > 8 ký tự, giữ 8 ký tự confidence cao nhất
+             (biển VN chuẩn = 7–8 ký tự; > 8 luôn là nhiễu)
+          3. Sắp xếp lại theo thứ tự đọc gốc (index ban đầu)
+        """
+        # Bước 1: Nhận dạng tất cả ký tự kèm index gốc
+        indexed = []
+        for idx, item in enumerate(char_imgs):
+            ch, conf = self.predict(item["image"])
+            indexed.append({"idx": idx, "char": ch, "confidence": conf})
+
+        # Bước 2: Loại bỏ ký tự nhiễu có confidence quá thấp
+        # Ký tự thật của biển VN thường > 50%; nhiễu/viền thường < 20%
+        MIN_CONF = 0.35
+        filtered = [r for r in indexed if r["confidence"] >= MIN_CONF]
+
+        # Nếu lọc quá mạnh (< 5 ký tự còn lại), nới lỏng ngưỡng
+        if len(filtered) < 5:
+            MIN_CONF = 0.15
+            filtered = [r for r in indexed if r["confidence"] >= MIN_CONF]
+
+        # Bước 3: Giới hạn tối đa 8 ký tự (chuẩn biển VN)
+        MAX_CHARS = 8
+        if len(filtered) > MAX_CHARS:
+            # Giữ MAX_CHARS ký tự có confidence cao nhất, rồi sort lại theo thứ tự đọc
+            filtered = sorted(filtered, key=lambda r: r["confidence"], reverse=True)[:MAX_CHARS]
+            filtered = sorted(filtered, key=lambda r: r["idx"])
+
+        results = [{"char": r["char"], "confidence": r["confidence"]} for r in filtered]
         raw_str = "".join(r["char"] for r in results)
         mean_conf = float(np.mean([r["confidence"] for r in results])) if results else 0.0
         formatted = self.format_plate(raw_str)

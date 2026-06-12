@@ -774,8 +774,28 @@ def detect_plate(car_img):
                 x2 = min(w_img, x+w+pad_x); y2 = min(h_img, y+h+pad_y)
                 plate_crop_raw = car_img[y1:y2, x1:x2]
 
-                # PERSPECTIVE CORRECTION — nắn biển lệch góc nhìn
-                plate_persp = _perspective_correct(plate_crop_raw)
+                # PERSPECTIVE CORRECTION — chỉ áp dụng nếu biển thực sự nghiêng
+                # Đo góc bằng minAreaRect trên vùng sáng của crop
+                plate_persp = plate_crop_raw  # mặc định: giữ nguyên
+                try:
+                    _lab = cv2.cvtColor(plate_crop_raw, cv2.COLOR_BGR2LAB)
+                    _l = cv2.split(_lab)[0]
+                    _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+                    _l = _clahe.apply(_l)
+                    _, _mask = cv2.threshold(_l, 0, 255,
+                                             cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    _cnts, _ = cv2.findContours(_mask, cv2.RETR_EXTERNAL,
+                                                cv2.CHAIN_APPROX_SIMPLE)
+                    if _cnts:
+                        _largest = max(_cnts, key=cv2.contourArea)
+                        _rect    = cv2.minAreaRect(_largest)
+                        _angle   = abs(_rect[2])          # 0–90° từ minAreaRect
+                        # minAreaRect trả 0° khi cạnh dài nằm ngang
+                        # → cạnh ngắn nghiêng > 5° là đáng lo
+                        if _angle > 5.0 and _angle < 85.0:
+                            plate_persp = _perspective_correct(plate_crop_raw)
+                except Exception:
+                    pass  # lỗi → giữ nguyên crop gốc
 
                 # DESKEW 4 COMBO — y chang reference lp_image.py
                 best_crop  = plate_persp.copy()
